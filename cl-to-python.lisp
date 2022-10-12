@@ -18,11 +18,19 @@
 (defparameter *results-for-unknown-commands* nil)
 (defparameter *None* 'None)
 (defparameter *wait-result-period* 0.1)
+;(defparameter *wait-result-period* 1)
+(defparameter *wait-output-period* 0.1)
+(defparameter *last-error* nil)
+;(defparameter *debug-python-worker* t)
+(defparameter *debug-python-worker* nil)
 
-(defstruct python-conn proc-info worker results (worker-exit-p nil))
+(defstruct python-conn proc-info worker results outputs (worker-exit-p nil))
 
 (defun results-hash ()
   (python-conn-results *python*))
+
+(defun outputs-hash ()
+  (python-conn-outputs *python*))
 
 (defun worker-exit-p ()
   (python-conn-worker-exit-p *python*))
@@ -34,6 +42,20 @@
     (format nil "[~a]" (princ-to-string (uuid:make-v4-uuid)))))
 
 (defparameter *uuid-len* (length (gen-uid)))
+
+;;;;;;;;;;; Python output ;;;;;;;;;;;;
+(defstruct python-output str-output)
+
+(defmethod print-object ((obj python-output) out)
+  (print-unreadable-object (obj out :type t)
+    (format out "~s" (python-output-str-output obj))))
+;(make-python-output :str-output "Some data")
+#|(make-python-output :str-output "Some oute
+Newline blabla
+Newline 2")
+|#
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defun get-py-script ()
   (uiop:native-namestring
@@ -127,57 +149,66 @@
          (type (elt sval *uuid-len*))
          (val (subseq sval (1+ *uuid-len*) bytes-count)))
     (log-info "deserialize-python-value: uuid = ~s, type = ~s, val = ~s" uuid type val)
-    (list (case type
-            (#\s val)
-            (#\i (parse-integer val))
-            (#\n *None*)
-            (#\v (parse-array val))
-            (#\b (cond
+    (list (handler-case (case type
+                          (#\s val)
+                          (#\i (parse-integer val))
+                          (#\n *None*)
+                          (#\v (parse-array val))
+                          (#\b (cond
                                  ((string= "True" val) t)
-                                 ((string= "False" val) t)
+                                 ((string= "False" val) nil)
                                  (t (error "Bad string for boolean type"))))
-            (#\_ (progn
+                          (#\_ (progn
                                  (if (search *error-prefix* val)
                                      (error val)
                                      (progn
                                        (warn "Returned native data presentation: ~s" val)
                                        val))))
-            (#\p (values))
-            (#\e (error (format nil "Error from python: ~s" val)))
-            (t (error "Not impelemented for type: ~s" type)))
+                          (#\p (values))
+                          (#\e (error 'python-error :text (format nil "Error from python: ~s" val)))
+                          (#\o (make-python-output :str-output val))
+                          (t (error "Not impelemented for type: ~s" type)))
+                                        ;(python-error ())
+            (python-error (err) err))
           uuid)
     )
   )
 
 (defparameter *slime-output* *standard-output*)
+(defparameter *slime-error-output* *error-output*)
 
 (defun log-info (msg &rest args)
   (format *slime-output* "~%~a" (apply #'format nil msg args))
   (finish-output *slime-output*))
 
-(defun set-wait-res (key-uuid)
-  (setf (gethash key-uuid (results-hash)) (list nil nil)))
 
-(defun set-res (key-uuid res)
+(defun log-error (msg &rest args)
+  (format *slime-error-output* "~%~%[ERROR]: ~a~%" (apply #'format nil msg args))
+  (finish-output *error-output*))
+
+(defun set-wait-res (key-uuid out-hash)
+  (setf (gethash key-uuid out-hash) (list nil nil)))
+
+(defun set-res (key-uuid res out-hash)
   (if (unknown-uuid-p key-uuid)
       (progn
         (warn "Added result for unknown uuid to *results-for-unknown-commands*, result = ~s" res)
         (push res *results-for-unknown-commands*))
       (multiple-value-bind (val present-p)
-          (gethash key-uuid (results-hash))
+          (gethash key-uuid out-hash)
         (if (not present-p)
             (error "Not waiting result for uid = ~s" key-uuid))
         (destructuring-bind (saved  &rest rest)
             (coerce val 'list)
           (declare (ignore rest))
           (if saved (error "Result already saved"))
-          (setf (gethash key-uuid (results-hash)) (vector t res))))))
+          (setf (gethash key-uuid out-hash) (vector t res))))))
 
-(defun get-res (key-uuid)
-  (log-info "results-hash = ~s" (results-hash))
+(defun get-res (key-uuid out-hash)
+  (log-info "results-hash = ~s" out-hash)
   (multiple-value-bind
         (val present-p)
-      (gethash key-uuid (results-hash))
+      (gethash key-uuid out-hash)
     (if (not present-p)
         (values nil nil)
         (destructuring-bind (has-come-p res)
@@ -195,12 +226,10 @@
 |#
 ;(worker-python)
 
-(defun worker-python (&aux slen len)
-  (if (not (python-alive-p))
-      (progn
-        (error "Python don't running (maybe required to call (py-start)?)")
-        ;(return-from worker-python)
-        ))
+(define-condition python-error (error)
+  ((text :initarg :text :reader text)))
+
+(defun %worker-python (&aux slen len)
   (loop with python-output = (uiop:process-info-output (python-conn-proc-info *python*))
         with payload-seq
         with payload-count = 0
@@ -233,25 +262,25 @@
                            ;; TODO 0.1 to variable
                            (setf stage read-len)))))
           (read-len (progn
-                       (log-info "=== before read slen")
-                       (handler-case (setf slen (read-line python-output))
-                         (error (e)
-                           (format t "Error on ~s: ~s" stage e)
-                           (loop-finish)))
-                       (log-info "=== after read slen, slen = ~s" slen)
-                       (setf len (ignore-errors (parse-integer slen)))
-                       (when (not len)
-                         (progn (error "Bad parsing len: ~s" slen)
-                                (loop-finish)))
-                       (log-info "=== before set stage: " read-payload)
-                       (setf stage read-payload)
-                       (log-info "=== after set stage, stage = ~s" stage)))
+                      (log-info "=== before read slen")
+                      (handler-case (setf slen (read-line python-output))
+                        (error (e)
+                          (format t "Error on ~s: ~s" stage e)
+                          (loop-finish)))
+                      (log-info "=== after read slen, slen = ~s" slen)
+                      (setf len (ignore-errors (parse-integer slen)))
+                      (when (not len)
+                        (progn (error "Bad parsing len: ~s" slen)
+                               (loop-finish)))
+                      (log-info "=== before set stage: " read-payload)
+                      (setf stage read-payload)
+                      (log-info "=== after set stage, stage = ~s" stage)))
           (read-payload (let (bytes-count)
                           (log-info "=== before read payload")
                           (if (zerop payload-count)
                               ;; Start read payload
                               (setf payload-seq (make-sequence '(vector (unsigned-byte 8)) len)))
-                          ;(setf payload-view (make-array (- len payload-count) :element-type '(unsigned-byte 8) :displaced-to payload-seq :displaced-index-offset payload-count))
+                                        ;(setf payload-view (make-array (- len payload-count) :element-type '(unsigned-byte 8) :displaced-to payload-seq :displaced-index-offset payload-count))
                           (handler-case (setf bytes-count (read-sequence payload-seq python-output :start payload-count :end len))
                             (error (e)
                               (format t "Error on ~s: ~s" stage e)
@@ -265,13 +294,26 @@
                                 (progn
                                   (destructuring-bind (val uuid)
                                       (deserialize-python-value payload-seq readed-bytes)
-                                    (set-res uuid val)
+                                    (set-res uuid val (if (typep val 'python-output)
+                                                          (outputs-hash)
+                                                          (results-hash)))
                                     (log-info (format nil "After set-res: res = ~s, uuid = ~s" val uuid)))
                                   (setf payload-count 0
                                         payload-seq nil
                                         stage read-op)))))))))
 
-(defun run-python-worker (python)
+(defun worker-python ()
+  (if (not (python-alive-p))
+      (progn
+        (error "Python don't running (maybe required to call (py-start)?)"))
+      (handler-case (%worker-python)
+        (error (err)
+          (log-error "in worker-python: ~a " err)
+          (setf *last-error* err)
+          (if *debug-python-worker* (error err))))))
+  
+
+(defun run-python-worker (&optional (python *python*))
   (log-info "Before run worker")
   (setf (python-conn-worker python)
         (make-thread 'worker-python :name "Python thread" :initial-bindings (cons (list '*python* 'identity *python*) *default-special-bindings*))
@@ -281,7 +323,10 @@
 (defun py-start (&aux python-proc-info)
   (if (python-alive-p) (py-stop))
   (setf python-proc-info (uiop:launch-program (uiop:strcat *python-cmd* " " (get-py-script)) :output :stream :input :stream :error-output :stream))
-  (setf *python* (make-python-conn :proc-info python-proc-info :results (make-hash-table :test 'equal)))
+  (setf *python* (make-python-conn :proc-info python-proc-info
+                                   ;; TODO Move to constructor
+                                   :results (make-hash-table :test 'equal)
+                                   :outputs (make-hash-table :test 'equal)))
   (run-python-worker *python*))
 
 (defun python-alive-p ()
@@ -314,14 +359,8 @@
 ;(py-start)
 (defparameter *continue-sent-empty-command* t)
 ;(defparameter *continue-sent-empty-command* nil)
-(defun send-to-python (cmd &optional (op "e") &aux #|seq bytes-count slen th|# uuid)
-  (maybe-restart-python)
-  (if (not (python-alive-p))
-      (error "Python isn't running"))
-  (setf uuid (gen-uid))
-  (setf cmd (uiop:strcat uuid cmd))
-  (set-wait-res uuid)
-  (write-to-python op cmd)
+
+(defun wait-value-loop (uuid out-hash)
   (loop 
     with res
     while t
@@ -329,14 +368,14 @@
     do
     (multiple-value-bind (val has-come-p)
         (progn
-          (log-info "trying getting res")
-          (let ((val-and-has-come-p (multiple-value-list (get-res uuid))))
+          (log-info "trying getting res, is output wait: ~a" (eql out-hash (outputs-hash)))
+          (let ((val-and-has-come-p (multiple-value-list (get-res uuid out-hash))))
             (log-info "got results: ~s" val-and-has-come-p)
             (values-list val-and-has-come-p)))
       (if has-come-p
           (progn
             (setf res val)
-            (remhash uuid (results-hash))
+            (remhash uuid out-hash)
             (loop-finish))
           ;; Note: It required than wakeup python (it hanging on read input on my system (windows))
           (progn
@@ -344,14 +383,28 @@
             (if *continue-sent-empty-command*
                 ;; TODO Rid of using uuid for stub message
                 (let ((uuid-stub (gen-uid)))
-                  ;(set-wait-res uuid-stub)
                   (write-to-python "e" uuid-stub)))
             ;; TODO 1 to variable
             (sleep *wait-result-period*))
           ))))
 
+(defun send-to-python (cmd &optional (op "e") &aux #|seq bytes-count slen th|# uuid)
+  (maybe-restart-python)
+  (if (not (python-alive-p))
+      (error "Python isn't running"))
+  (setf uuid (gen-uid))
+  (setf cmd (uiop:strcat uuid cmd))
+  (set-wait-res uuid (results-hash))
+  (set-wait-res uuid (outputs-hash))
+  (write-to-python op cmd)
+  (values (wait-value-loop uuid (results-hash))
+          (wait-value-loop uuid (outputs-hash))))
+
 (defun py-eval (cmd)
   (send-to-python cmd "e"))
+
+(defun py-peval (cmd)
+  (send-to-python cmd "p"))
 
 (defun py-exec (cmd)
   (send-to-python cmd "x"))

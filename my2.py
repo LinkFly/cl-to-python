@@ -3,6 +3,7 @@ import time
 import threading
 import os
 import psutil
+from io import StringIO
 
 ### Config vars
 log_file_name = "log.txt"
@@ -14,8 +15,6 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 log_path = this_dir + '/' + log_dir_name + '/' + log_file_name
 
 ### Internal vars
-# Evaluating context
-eval_globals = {}
 # Finish main loop
 finish = False
 # Control of running thread for checking parent (when parent exit - exit this process)
@@ -48,6 +47,8 @@ lisp_type_to_sym = {
 }
 sym_pass = 'p'
 sym_error = 'e'
+sym_internal = '_'
+sym_out = 'o'
 ### end Type prefixes ###
 
 def log(msg):
@@ -67,26 +68,63 @@ def get_pass_type_spec():
     return sym_pass
 
 
+def get_type_out_spec():
+    return sym_out
+
+
 def get_error_type_spec(val):
     return sym_error
 
 
 def get_type_spec(val):
-    
     try:
-        lisp_type = python_to_lisp_type[type(val)]
-        local_res = lisp_type_to_sym[lisp_type]
+        lisp_type = python_to_lisp_type.get(type(val))
+        if lisp_type is None:
+            if isinstance(val, Exception):
+                local_res = get_error_type_spec(val)
+            else:
+                local_res = '_'
+        else:
+            local_res = lisp_type_to_sym[lisp_type]
     except Exception as err:
         local_res = get_error_type_spec(err) + '<error get_type_spec(%s)>' % str(err)
     return local_res
 
 
+threads_outputs = {}
+
+
+def custom_print(str):
+    out = threads_outputs.get(threading.currentThread().getName())
+    if out is None:
+        print(str)
+    else:
+        out.write(str + '\n')
+    return None
+
+
+print = custom_print
+
+threads_results = {}
+
+# Evaluating context
+eval_globals = {'threads_results': threads_results, 'threads_outputs': threads_outputs, 'print': custom_print}
+
+
 def thread_runner(cmd):
-    return eval(cmd, eval_globals)
+    threads_outputs[threading.currentThread().getName()] = StringIO()
+    local_res = eval(cmd, eval_globals)
+    res_and_out = [local_res, local_out.getvalue()]
+    del threads_outputs[threading.currentThread().getName()]
+    threads_results[threading.currentThread().getName()] = res_and_out
 
 
 def process_cmd(operation, cmd):
     local_res = ''
+    local_out = StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = local_out
+    th = None
     try:
         if operation == 'e':
             log('eval: ' + str(cmd))
@@ -99,10 +137,7 @@ def process_cmd(operation, cmd):
         elif operation == 'p':
             log('parallel eval: ' + str(cmd))
             th = threading.Thread(target=thread_runner, args=(cmd,))
-            logging.info("Before running thread for eval")
-            th.start()
-            logging.info("After running thread for eval")
-            local_res = None
+            local_res = th.getName()
             log('process_cmd local_res: ' + str(local_res))
         elif operation == 'f':
             global finish
@@ -111,8 +146,16 @@ def process_cmd(operation, cmd):
     except Exception as err:
         local_res = err
         log('exception (into process_cmd): ' + str(local_res))
+    if th is not None:
+        log("Before running thread for eval")
+        th.start()
+        log("After running thread for eval")
+        #th.join()
+        log("After Join")
+    sys.stdout = old_stdout
+    log('output: ' + local_out.getvalue())
 
-    return local_res
+    return local_res, local_out.getvalue()
 
 
 def prepare_res(res, uuid):
@@ -216,21 +259,33 @@ while True:
             # TODO 38 to variable
             uuid = cmd[0:38]
             cmd = cmd[38:]
+            resOut = ''
             if cmd == '':
                 res = get_pass_type_spec()
                 log('pass')
             else:
-                res = process_cmd(op, cmd)
+                resPair = process_cmd(op, cmd)
+                res = resPair[0]
+                resOut = resPair[1]
                 res = get_type_spec(res) + str(res)
     except Exception as e:
-        res = '<error_' + str(e) + 'op = %s, uuid = %s, cmd = %s' % (op, uuid, cmd) + '>'
+        res = '<error_' + str(e) + ', context: op = %s, uuid = %s, cmd = %s' % (op, uuid, cmd) + '>'
         res = get_error_type_spec(res) + res
 
     if res != get_pass_type_spec():
         prepared_res = prepare_res(res, uuid)
-        sys.stdout.write(prepared_res)
-        sys.stdout.flush()
+        sys.stdout.buffer.write(bytes(prepared_res, 'utf8'))
+        sys.stdout.buffer.flush()
         log('sent result: ' + prepared_res)
+        # Send output (maybe empty)
+
+        if os.linesep != '\n':
+            resOut = resOut.replace(os.linesep, '\n')
+        resOut = get_type_out_spec() + resOut
+        prepared_res = prepare_res(resOut, uuid)
+        sys.stdout.buffer.write(bytes(prepared_res, 'utf8'))
+        sys.stdout.buffer.flush()
+        log('sent output: ' + prepared_res)
     uuid = ''
     cmd = ''
     res = ''
