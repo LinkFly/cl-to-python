@@ -91,34 +91,39 @@ def get_type_spec(val):
     return local_res
 
 
+threads_results = {}
 threads_outputs = {}
 
 
 def custom_print(str):
     out = threads_outputs.get(threading.currentThread().getName())
     if out is None:
-        print(str)
+        sys.stdout.write(str + '\n')
+        sys.stdout.flush()
     else:
         out.write(str + '\n')
+        out.flush()
     return None
 
 
-print = custom_print
-
-threads_results = {}
 
 # Evaluating context
-eval_globals = {'threads_results': threads_results, 'threads_outputs': threads_outputs, 'print': custom_print}
+eval_globals = {'threads_results': threads_results, 'threads_outputs': threads_outputs, 'custom_print': custom_print}
 
 
 def thread_runner(cmd):
-    threads_outputs[threading.currentThread().getName()] = StringIO()
-    local_res = eval(cmd, eval_globals)
+    th_name = threading.currentThread().getName()
+    local_out = StringIO()
+    threads_outputs[th_name] = local_out
+    try:
+        local_res = eval(cmd, eval_globals)
+    except Exception as err:
+        local_res = err
     res_and_out = [local_res, local_out.getvalue()]
-    del threads_outputs[threading.currentThread().getName()]
+    #del threads_outputs[th_name]
     threads_results[threading.currentThread().getName()] = res_and_out
 
-
+# asdf
 def process_cmd(operation, cmd):
     local_res = ''
     local_out = StringIO()

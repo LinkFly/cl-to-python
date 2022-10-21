@@ -20,6 +20,7 @@
 (defparameter *wait-result-period* 0.1)
 ;(defparameter *wait-result-period* 1)
 (defparameter *wait-output-period* 0.1)
+;(defparameter *wait-output-period* 1)
 (defparameter *last-error* nil)
 ;(defparameter *debug-python-worker* t)
 (defparameter *debug-python-worker* nil)
